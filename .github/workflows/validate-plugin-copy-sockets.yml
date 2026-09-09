@@ -1,0 +1,34 @@
+name: Validate plugin socket copy
+on:
+  push:
+    branches:
+      - codex/validate-plugin-copy-sockets-20260909
+permissions:
+  contents: read
+jobs:
+  native-tests:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - name: Check out the exact contribution commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          ref: c2689c955b256e417f99ac86cfc92e5fca9530f1
+          persist-credentials: false
+      - name: Set up the upstream CI Go version
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
+        with:
+          go-version: '1.27.0'
+      - name: Record native platform and tested commit
+        run: |
+          go version
+          go env GOOS GOARCH
+          git rev-parse HEAD
+      - name: Exercise the real socket regression
+        run: go test -v ./internal/third_party/dep/fs -run '^TestCopyDirSkipsSocket$' -count=1
+      - name: Test filesystem and plugin installers
+        run: go test ./internal/third_party/dep/fs ./internal/plugin/installer/... -count=1 -timeout=10m
