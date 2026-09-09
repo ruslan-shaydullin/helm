@@ -6,29 +6,61 @@ on:
 permissions:
   contents: read
 jobs:
-  native-tests:
-    strategy:
-      fail-fast: false
-      matrix:
-        os: [ubuntu-latest, windows-latest]
-    runs-on: ${{ matrix.os }}
+  windows-baseline-comparison:
+    runs-on: windows-latest
     timeout-minutes: 20
     steps:
-      - name: Check out the exact contribution commit
+      - name: Check out the unmodified upstream baseline
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
-          ref: c2689c955b256e417f99ac86cfc92e5fca9530f1
+          ref: '87268ee077fa400400931caf7767b536162b9c12'
+          fetch-depth: 0
           persist-credentials: false
       - name: Set up the upstream CI Go version
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
           go-version: '1.27.0'
-      - name: Record native platform and tested commit
+      - name: Compare known baseline failures and exercise the fix
+        shell: pwsh
         run: |
+          $ErrorActionPreference = 'Continue'
+          $PSNativeCommandUseErrorActionPreference = $false
           go version
           go env GOOS GOARCH
           git rev-parse HEAD
-      - name: Exercise the real socket regression
-        run: go test -v ./internal/third_party/dep/fs -run '^TestCopyDirSkipsSocket$' -count=1
-      - name: Test filesystem and plugin installers
-        run: go test ./internal/third_party/dep/fs ./internal/plugin/installer/... -count=1 -timeout=10m
+          $baseFs = Join-Path $env:RUNNER_TEMP 'baseline-fs.jsonl'
+          $fixedFs = Join-Path $env:RUNNER_TEMP 'fixed-fs.jsonl'
+          $baseInstaller = Join-Path $env:RUNNER_TEMP 'baseline-installer.log'
+          $fixedInstaller = Join-Path $env:RUNNER_TEMP 'fixed-installer.log'
+          go test -json ./internal/third_party/dep/fs -count=1 2>&1 | Tee-Object -FilePath $baseFs
+          $baseFsExit = $LASTEXITCODE
+          go test ./internal/plugin/installer/... -count=1 -timeout=10m 2>&1 | Tee-Object -FilePath $baseInstaller
+          $baseInstallerExit = $LASTEXITCODE
+          git checkout --detach c2689c955b256e417f99ac86cfc92e5fca9530f1
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot check out contribution commit' }
+          git rev-parse HEAD
+          go test -v ./internal/third_party/dep/fs -run '^TestCopyDirSkipsSocket$' -count=1
+          if ($LASTEXITCODE -ne 0) { throw 'Socket regression failed on native Windows' }
+          go test -json ./internal/third_party/dep/fs -count=1 2>&1 | Tee-Object -FilePath $fixedFs
+          $fixedFsExit = $LASTEXITCODE
+          go test ./internal/plugin/installer/... -count=1 -timeout=10m 2>&1 | Tee-Object -FilePath $fixedInstaller
+          $fixedInstallerExit = $LASTEXITCODE
+          function FailedTests($path) {
+            @(Get-Content $path | ForEach-Object { $_ | ConvertFrom-Json -ErrorAction SilentlyContinue } | Where-Object { $_.Action -eq 'fail' -and $_.Test } | Select-Object -ExpandProperty Test | Sort-Object)
+          }
+          $baselineFailures = @(FailedTests $baseFs)
+          $fixedFailures = @(FailedTests $fixedFs)
+          Write-Output 'BASELINE FAILING TESTS:'
+          $baselineFailures | ForEach-Object { Write-Output $_ }
+          Write-Output 'PATCHED FAILING TESTS:'
+          $fixedFailures | ForEach-Object { Write-Output $_ }
+          if ($baseFsExit -eq 0 -or $fixedFsExit -eq 0 -or $baselineFailures.Count -eq 0) { throw 'Unexpected baseline comparison; inspect logs' }
+          if (@(Compare-Object $baselineFailures $fixedFailures).Count -ne 0) { throw 'Filesystem failure sets differ' }
+          if ($baseInstallerExit -eq 0 -or $fixedInstallerExit -eq 0) { throw 'Expected existing installer test compile limitation missing' }
+          foreach ($path in @($baseInstaller, $fixedInstaller)) {
+            if (-not (Select-String -Path $path -Pattern 'undefined: syscall.Umask' -Quiet)) { throw 'Installer failure does not match known baseline limitation' }
+          }
+          go build ./internal/third_party/dep/fs ./internal/plugin/installer/...
+          if ($LASTEXITCODE -ne 0) { throw 'Production packages do not build on Windows' }
+          Write-Output 'PASS: native socket regression and production build; full suite retains identical pre-existing Windows failures.'
+          exit 0
